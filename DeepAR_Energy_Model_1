@@ -1,0 +1,198 @@
+%pip install --quiet --upgrade s3fs
+
+
+from __future__ import print_function
+
+%matplotlib inline
+
+import sys
+import zipfile
+from dateutil.parser import parse
+import json
+from random import shuffle
+import random
+import datetime
+import os
+
+import boto3
+import s3fs
+import sagemaker
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import timedelta
+
+from ipywidgets import interact, interactive, fixed, interact_manual
+import ipywidgets as widgets
+from ipywidgets import IntSlider, FloatSlider, Checkbox
+
+
+sagemaker.config INFO - Not applying SDK defaults from location: /etc/xdg/sagemaker/config.yaml
+sagemaker.config INFO - Not applying SDK defaults from location: /home/sagemaker-user/.config/sagemaker/config.yaml
+
+
+# set random seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
+
+
+sagemaker_session = sagemaker.Session()
+
+
+s3_bucket = sagemaker.Session().default_bucket()  # replace with an existing bucket if needed
+s3_bucket_prefix = (
+    "deepar-electricity-demo-notebook"  # prefix used for all data stored within the bucket
+)
+default_bucket_prefix = sagemaker.Session().default_bucket_prefix
+
+# If a default bucket prefix is specified, append it to the s3 path
+if default_bucket_prefix:
+    s3_prefix = f"{default_bucket_prefix}/{s3_bucket_prefix}"
+else:
+    s3_prefix = s3_bucket_prefix
+
+role = sagemaker.get_execution_role()  # IAM role to use by SageMaker
+
+
+region = sagemaker_session.boto_region_name
+
+s3_data_path = "s3://{}/{}/data".format(s3_bucket, s3_prefix)
+s3_output_path = "s3://{}/{}/output".format(s3_bucket, s3_prefix)
+
+
+# Next, we configure the container image to be used for the region that we are running in.
+
+image_name = sagemaker.image_uris.retrieve("forecasting-deepar", region)
+
+
+# Import electricity dataset and upload it to S3 to make it available for Sagemaker
+DATA_HOST = f"sagemaker-example-files-prod-{region}"
+DATA_PATH = "datasets/timeseries/uci_electricity/"
+ARCHIVE_NAME = "LD2011_2014.txt.zip"
+FILE_NAME = ARCHIVE_NAME[:-4]
+
+
+s3_client = boto3.client("s3")
+
+if not os.path.isfile(FILE_NAME):
+    print("downloading dataset (258MB), can take a few minutes depending on your connection")
+    s3_client.download_file(DATA_HOST, DATA_PATH + ARCHIVE_NAME, ARCHIVE_NAME)
+
+    print("\nextracting data archive")
+    zip_ref = zipfile.ZipFile(ARCHIVE_NAME, "r")
+    zip_ref.extractall("./")
+    zip_ref.close()
+else:
+    print("File found skipping download")
+
+
+# load and parse the dataset and convert it to a collection of Pandas time series
+data = pd.read_csv(FILE_NAME, sep=";", index_col=0, parse_dates=True, decimal=",")
+num_timeseries = data.shape[1]
+data_kw = data.resample("2h").sum() / 8
+timeseries = []
+for i in range(num_timeseries):
+    timeseries.append(np.trim_zeros(data_kw.iloc[:, i], trim="f"))
+
+
+# plot the resulting time series for the first ten customers for the time period spanning the first two weeks of 2014.
+fig, axs = plt.subplots(5, 2, figsize=(20, 20), sharex=True)
+axx = axs.ravel()
+for i in range(0, 10):
+    timeseries[i].loc["2014-01-01":"2014-01-14"].plot(ax=axx[i])
+    axx[i].set_xlabel("date")
+    axx[i].set_ylabel("kW consumption")
+    axx[i].grid(which="minor", axis="x")
+
+
+# Train and Test Splits
+# we use 2 hour frequency for the time series
+freq = "2h"
+
+# we predict for 7 days
+prediction_length = 7 * 12
+
+# we also use 7 days as context length, this is the number of state updates accomplished before making predictions
+context_length = 7 * 12
+
+
+# specify portion of data used for training
+start_dataset = pd.Timestamp("2014-01-01 00:00:00")
+end_training = pd.Timestamp("2014-09-01 00:00:00")
+
+
+training_data = [
+    {
+        "start": str(start_dataset),
+        "target": ts[
+            start_dataset : end_training - timedelta(days=1)
+        ].tolist(),  # We use -1, because pandas indexing includes the upper bound
+    }
+    for ts in timeseries
+]
+print(len(training_data))
+
+
+num_test_windows = 4
+
+test_data = [
+    {
+        "start": str(start_dataset),
+        "target": ts[start_dataset : end_training + timedelta(days=k * prediction_length)].tolist(),
+    }
+    for k in range(1, num_test_windows + 1)
+    for ts in timeseries
+]
+print(len(test_data))
+
+
+#write to the dictionary json file
+def write_dicts_to_file(path, data):
+    with open(path, "wb") as fp:
+        for d in data:
+            fp.write(json.dumps(d).encode("utf-8"))
+
+%%time
+write_dicts_to_file("train.json", training_data)
+write_dicts_to_file("test.json", test_data)
+            fp.write("\n".encode("utf-8"))
+
+
+#copy local data files to S3 wheree DeepAR can access them
+s3 = boto3.resource("s3")
+
+
+def copy_to_s3(local_file, s3_path, override=False):
+    assert s3_path.startswith("s3://")
+    split = s3_path.split("/")
+    bucket = split[2]
+    path = "/".join(split[3:])
+    buk = s3.Bucket(bucket)
+
+    if len(list(buk.objects.filter(Prefix=path))) > 0:
+        if not override:
+            print(
+                "File s3://{}/{} already exists.\nSet override to upload anyway.\n".format(
+                    s3_bucket, s3_path
+                )
+            )
+            return
+        else:
+            print("Overwriting existing file")
+    with open(local_file, "rb") as data:
+        print("Uploading file to {}".format(s3_path))
+        buk.put_object(Key=path, Body=data)
+
+
+%%time
+copy_to_s3("train.json", s3_data_path + "/train/train.json")
+copy_to_s3("test.json", s3_data_path + "/test/test.json")
+
+
+#Let's view what whas written to S3
+s3_sample = s3.Object(s3_bucket, s3_prefix + "/data/train/train.json").get()["Body"].read()
+StringVariable = s3_sample.decode("UTF-8", "ignore")
+lines = StringVariable.split("\n")
+print(lines[0][:100] + "...")
+
+
