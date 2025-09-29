@@ -195,4 +195,242 @@ StringVariable = s3_sample.decode("UTF-8", "ignore")
 lines = StringVariable.split("\n")
 print(lines[0][:100] + "...")
 
+# Train the Model
+# Here we define the estimator that will launch the training job.
 
+estimator = sagemaker.estimator.Estimator(
+    image_uri=image_name,
+    sagemaker_session=sagemaker_session,
+    role=role,
+    train_instance_count=1,
+    train_instance_type="ml.c4.2xlarge",
+    base_job_name="deepar-electricity-demo",
+    output_path=s3_output_path,
+)
+
+hyperparameters = {
+    "time_freq": freq,
+    "epochs": "400",
+    "early_stopping_patience": "40",
+    "mini_batch_size": "64",
+    "learning_rate": "5E-4",
+    "context_length": str(context_length),
+    "prediction_length": str(prediction_length),
+}
+
+estimator.set_hyperparameters(**hyperparameters)
+
+%%time
+data_channels = {"train": "{}/train/".format(s3_data_path), "test": "{}/test/".format(s3_data_path)}
+
+estimator.fit(inputs=data_channels, wait=True)
+
+# Create endpoint and predictor
+# Now that we have a trained model, we can use it to perform predictions by deploying it to an endpoint.
+# NOTE: Remember to delete the endpoint after running this experiment.
+
+from sagemaker.serializers import IdentitySerializer
+
+class DeepARPredictor(sagemaker.predictor.Predictor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            # serializer=JSONSerializer(),
+            serializer=IdentitySerializer(content_type="application/json"),
+            **kwargs,
+        )
+
+    def predict(
+        self,
+        ts,
+        cat=None,
+        dynamic_feat=None,
+        num_samples=100,
+        return_samples=False,
+        quantiles=["0.1", "0.5", "0.9"],
+    ):
+        """Requests the prediction of for the time series listed in `ts`, each with the (optional)
+        corresponding category listed in `cat`.
+
+        ts -- `pandas.Series` object, the time series to predict
+        cat -- integer, the group associated to the time series (default: None)
+        num_samples -- integer, number of samples to compute at prediction time (default: 100)
+        return_samples -- boolean indicating whether to include samples in the response (default: False)
+        quantiles -- list of strings specifying the quantiles to compute (default: ["0.1", "0.5", "0.9"])
+
+        Return value: list of `pandas.DataFrame` objects, each containing the predictions
+        """
+        prediction_time = ts.index[-1] + ts.index.freq
+        quantiles = [str(q) for q in quantiles]
+        req = self.__encode_request(ts, cat, dynamic_feat, num_samples, return_samples, quantiles)
+        res = super(DeepARPredictor, self).predict(req)
+        return self.__decode_response(res, ts.index.freq, prediction_time, return_samples)
+
+    def __encode_request(self, ts, cat, dynamic_feat, num_samples, return_samples, quantiles):
+        instance = series_to_dict(
+            ts, cat if cat is not None else None, dynamic_feat if dynamic_feat else None
+        )
+
+        configuration = {
+            "num_samples": num_samples,
+            "output_types": ["quantiles", "samples"] if return_samples else ["quantiles"],
+            "quantiles": quantiles,
+        }
+
+        http_request_data = {"instances": [instance], "configuration": configuration}
+
+        return json.dumps(http_request_data).encode("utf-8")
+
+    def __decode_response(self, response, freq, prediction_time, return_samples):
+        # we only sent one time series so we only receive one in return
+        # however, if possible one will pass multiple time series as predictions will then be faster
+        predictions = json.loads(response.decode("utf-8"))["predictions"][0]
+        prediction_length = len(next(iter(predictions["quantiles"].values())))
+        prediction_index = pd.date_range(
+            start=prediction_time, freq=freq, periods=prediction_length
+        )
+        if return_samples:
+            dict_of_samples = {"sample_" + str(i): s for i, s in enumerate(predictions["samples"])}
+        else:
+            dict_of_samples = {}
+        return pd.DataFrame(
+            data={**predictions["quantiles"], **dict_of_samples}, index=prediction_index
+        )
+
+    def set_frequency(self, freq):
+        self.freq = freq
+
+
+def encode_target(ts):
+    return [x if np.isfinite(x) else "NaN" for x in ts]
+
+
+def series_to_dict(ts, cat=None, dynamic_feat=None):
+    """Given a pandas.Series object, returns a dictionary encoding the time series.
+
+    ts -- a pands.Series object with the target time series
+    cat -- an integer indicating the time series category
+
+    Return value: a dictionary
+    """
+    obj = {"start": str(ts.index[0]), "target": encode_target(ts)}
+    if cat is not None:
+        obj["cat"] = cat
+    if dynamic_feat is not None:
+        obj["dynamic_feat"] = dynamic_feat
+    return obj
+
+# Deploy the Model
+predictor = estimator.deploy(
+    initial_instance_count=1, instance_type="ml.m5.large", predictor_cls=DeepARPredictor
+)
+
+# Make predictions and plot results!
+
+predictor.predict(ts=timeseries[120], quantiles=[0.10, 0.5, 0.90]).head()
+
+def plot(
+    predictor,
+    target_ts,
+    cat=None,
+    dynamic_feat=None,
+    forecast_date=end_training,
+    show_samples=False,
+    plot_history=7 * 12,
+    confidence=80,
+):
+    freq = target_ts.index.freq
+    print(
+        "calling served model to generate predictions starting from {}".format(str(forecast_date))
+    )
+    assert confidence > 50 and confidence < 100
+    low_quantile = 0.5 - confidence * 0.005
+    up_quantile = confidence * 0.005 + 0.5
+
+    # we first construct the argument to call our model
+    args = {
+        "ts": target_ts[:forecast_date],
+        "return_samples": show_samples,
+        "quantiles": [low_quantile, 0.5, up_quantile],
+        "num_samples": 100,
+    }
+
+    if dynamic_feat is not None:
+        args["dynamic_feat"] = dynamic_feat
+        fig = plt.figure(figsize=(20, 6))
+        ax = plt.subplot(2, 1, 1)
+    else:
+        fig = plt.figure(figsize=(20, 3))
+        ax = plt.subplot(1, 1, 1)
+
+    if cat is not None:
+        args["cat"] = cat
+        ax.text(0.9, 0.9, "cat = {}".format(cat), transform=ax.transAxes)
+
+    # call the end point to get the prediction
+    prediction = predictor.predict(**args)
+
+    # plot the samples
+    if show_samples:
+        for key in prediction.keys():
+            if "sample" in key:
+                prediction[key].plot(color="lightskyblue", alpha=0.2, label="_nolegend_")
+
+    # plot the target
+    target_section = target_ts[
+        forecast_date - plot_history * freq : forecast_date + prediction_length * freq
+    ]
+    target_section.plot(color="black", label="target")
+
+    # plot the confidence interval and the median predicted
+    ax.fill_between(
+        prediction[str(low_quantile)].index,
+        prediction[str(low_quantile)].values,
+        prediction[str(up_quantile)].values,
+        color="b",
+        alpha=0.3,
+        label="{}% confidence interval".format(confidence),
+    )
+    prediction["0.5"].plot(color="b", label="P50")
+    ax.legend(loc=2)
+
+    # fix the scale as the samples may change it
+    ax.set_ylim(target_section.min() * 0.5, target_section.max() * 1.5)
+
+    if dynamic_feat is not None:
+        for i, f in enumerate(dynamic_feat, start=1):
+            ax = plt.subplot(len(dynamic_feat) * 2, 1, len(dynamic_feat) + i, sharex=ax)
+            feat_ts = pd.Series(
+                index=pd.date_range(
+                    start=target_ts.index[0], freq=target_ts.index.freq, periods=len(f)
+                ),
+                data=f,
+            )
+            feat_ts[
+                forecast_date - plot_history * freq : forecast_date + prediction_length * freq
+            ].plot(ax=ax, color="g")
+
+style = {"description_width": "initial"}
+
+@interact_manual(
+    customer_id=IntSlider(min=0, max=369, value=91, style=style),
+    forecast_day=IntSlider(min=0, max=100, value=51, style=style),
+    confidence=IntSlider(min=60, max=95, value=80, step=5, style=style),
+    history_weeks_plot=IntSlider(min=1, max=20, value=1, style=style),
+    show_samples=Checkbox(value=False),
+    continuous_update=False,
+)
+def plot_interact(customer_id, forecast_day, confidence, history_weeks_plot, show_samples):
+    plot(
+        predictor,
+        target_ts=timeseries[customer_id],
+        forecast_date=end_training + datetime.timedelta(days=forecast_day),
+        show_samples=show_samples,
+        plot_history=history_weeks_plot * 12 * 7,
+        confidence=confidence,
+    )
+
+# Delete endpoints
+
+predictor.delete_model()
+predictor.delete_endpoint()
